@@ -37,7 +37,7 @@ if [[ ! -d dyncall ]]; then
   svn co https://dyncall.org/svn/dyncall/trunk dyncall
   if [[ -f dyncall.diff ]]; then
     cd dyncall
-    patch -i ../dyncall.diff -N -p0
+    patch -i ../dyncall.diff -N -p0 || ( cd .. ; rm -fR dyncall ; echo "Failed to patch dyncall, deleted it." ; exit 1 )
     cd ..
   fi
 else
