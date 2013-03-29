@@ -1,0 +1,304 @@
+Index: dyncall/dynload/dynload_syms_mach-o.c
+===================================================================
+--- dyncall/dynload/dynload_syms_mach-o.c	(revision 1391)
++++ dyncall/dynload/dynload_syms_mach-o.c	(working copy)
+@@ -28,7 +28,10 @@
+  dynamic symbol resolver for Mach-O
+ 
+ */
++#include "../autovar/autovar_ARCH.h"
+ 
++#include <stdio.h>
++
+ #include "dynload.h"
+ #include "dynload_alloc.h"
+ 
+@@ -39,30 +42,155 @@
+ 
+ #if defined(ARCH_X64)
+ #define MACH_HEADER_TYPE mach_header_64
++#define MACH_MAGIC MH_MAGIC_64
+ #define SEGMENT_COMMAND segment_command_64
+ #define NLIST_TYPE nlist_64
+ #else
+ #define MACH_HEADER_TYPE mach_header
++#define MACH_MAGIC MH_MAGIC
+ #define SEGMENT_COMMAND segment_command
+ #define NLIST_TYPE nlist
+ #endif
+ 
+-
+ struct DLLib_
+ {
+ 	char* libPath;
+ 	void* handle;
+ };
+ 
+-
+ struct DLSyms_
+ {
++  const char** decompressedSymbols;
+ 	const char* pStringTable;
+ 	const struct NLIST_TYPE* pSymbolTable;
+ 	uint32_t symbolCount;
+ };
+ 
++int isSameMacImageName(const char* libPath, const char* systemLibPath) {
++	if (!libPath || !systemLibPath)
++		return 0;
++	
++	if (!strcmp(libPath, systemLibPath))
++		return 1;
++	
++	if (strstr(libPath, "/libc.") && strstr(systemLibPath, "/libSystem."))
++		return 1;
++	
++	return 0;
++}
+ 
++///
++/// LEB128 DECODING (http://en.wikipedia.org/wiki/LEB128)
++///
++unsigned long long decode_leb128(const unsigned char** ppIn) {
++  const unsigned char* pIn = *ppIn;
++  unsigned char input;
++  unsigned long long decoded = 0;
++  int shift = 0;
++  do {
++    input = *pIn++;
++    decoded |= (((unsigned long long)(input & 0x7f)) << shift);
++    shift += 7;
++  } while (input & 0x80);
++  
++  *ppIn = pIn;
++  return decoded;
++}
++
++///
++/// DUMMY APPENDABLE STRING 
++///
++typedef struct _DCString {
++  char* buffer;
++  size_t capacity;
++} DCString;
++
++void initString(DCString* s, size_t capacity) {
++  if (!s)
++    return;
++  
++  s->buffer = dlAllocMem((s->capacity = capacity) + 1);
++  s->buffer[0] = '\0';
++}
++
++void appendString(DCString* s, const char* suffix) {
++  if (!s)
++    return;
++  
++  size_t suffixLen = strlen(suffix), sLen = strlen(s->buffer);
++  if (suffixLen + sLen > s->capacity) {
++    char* old = s->buffer;
++    initString(s, (suffixLen + sLen) * 3 / 2);
++    strcpy(s->buffer, old);
++    dlFreeMem(old);
++  }
++  strcpy(s->buffer + sLen, suffix);
++}
++
++void freeString(DCString* s) {
++  if (s->buffer) {
++    dlFreeMem(s->buffer);
++    s->buffer = NULL;
++    s->capacity = 0;
++  }
++}
++
++///
++/// MACHO COMPRESSED SYMBOLS TRIE VISITATION
++///
++typedef void (*SymbolOutputFunction)(const char* symbol, size_t index, void* payload);
++
++#define MAX_DEPTH 256
++
++size_t visitTrie(
++	const unsigned char* start, 
++	const unsigned char* current, 
++	const unsigned char* end, 
++	DCString* prefix, 
++	SymbolOutputFunction output, size_t indexOffset, void* payload, int depth) 
++{
++  size_t count = 0;
++  if (current < end && depth < MAX_DEPTH) {
++    unsigned char term_size = *current++;
++    if (term_size != 0) {
++      if (prefix && output)
++        output(prefix->buffer, indexOffset, payload);
++  
++      indexOffset++;
++      count++;
++      current += term_size;
++    }
++
++    unsigned char iSubNode, nSubNodes = *current++;
++    
++    size_t prefixLen = prefix ? strlen(prefix->buffer) : 0;
++    for (iSubNode = 0; iSubNode < nSubNodes; iSubNode++) {
++      unsigned long long subNodeOffset;
++      const char* suffix = (const char*)current;
++      current += strlen(suffix) + 1;
++      if (!(subNodeOffset = decode_leb128(&current)))
++          continue;
++      
++      appendString(prefix, suffix);
++      size_t subCount = visitTrie(start, start + subNodeOffset, end, prefix, output, indexOffset, payload, depth + 1);
++      count += subCount;
++      indexOffset += subCount;
++      if (prefix)
++        prefix->buffer[prefixLen] = '\0';
++    }
++  }
++  return count;
++}
++
++/// Callback to harvest symbols visited in trie
++void CopyToNthString(const char* str, size_t index, void* payload) {
++  const char** pstr = (const char**)payload;
++  size_t len = strlen(str);
++  char* copy = dlAllocMem(len + 1);
++  strcpy(copy, str);
++  pstr[index] = copy;
++}
++
+ DLSyms* dlSymsInit(const char* libPath) 
+ {
+ 	DLSyms* pSyms = NULL;
+@@ -70,27 +198,57 @@
+ 	for (iImage = 0, nImages = _dyld_image_count(); iImage < nImages; iImage++)
+ 	{
+ 		const char* name = _dyld_get_image_name(iImage);
+-		if (name && !strcmp(name, libPath))
++		if (isSameMacImageName(libPath, name))
+ 		{
+ 			const struct MACH_HEADER_TYPE* pHeader = (const struct MACH_HEADER_TYPE*) _dyld_get_image_header(iImage);
+ 			const char* pBase = ((const char*)pHeader);
++			if (!pHeader)
++				return NULL;
++
++			if (pHeader->magic != MACH_MAGIC)
++				return NULL;
+ 			if (pHeader->filetype != MH_DYLIB)
+ 				return NULL;
+-			if (pHeader->flags & MH_SPLIT_SEGS)
++			if (pHeader->flags & MH_SPLIT_SEGS || !(pHeader->flags & MH_DYLDLINK))
+ 				return NULL;
+-
+-			if (pHeader)
++			
+ 			{
+ 				uint32_t iCmd, nCmds = pHeader->ncmds;
+ 				const struct load_command* cmd = (const struct load_command*)(pBase + sizeof(struct MACH_HEADER_TYPE));
+ 				
+-				for (iCmd = 0; iCmd < nCmds; iCmd++) 
+-				{
+-					if (cmd->cmd == LC_SYMTAB) 
+-					{
++				for (iCmd = 0; iCmd < nCmds; iCmd++) {
++					if (cmd->cmd == LC_DYLD_INFO_ONLY || cmd->cmd == LC_DYLD_INFO) {
++            const struct dyld_info_command* dcmd = (const struct dyld_info_command*)cmd;
++            const unsigned char* trie = (pBase + dcmd->export_off);
++            
++            pSyms = (DLSyms*)( dlAllocMem(sizeof(DLSyms)) );
++            
++            // First, get the number of symbols
++            pSyms->symbolCount = visitTrie(trie, trie, trie + dcmd->export_size, NULL, NULL, 0, NULL, 0);
++            
++            if (pSyms->symbolCount) {
++              // Now revisit and copy symbols to their destination
++              DCString s;
++              size_t decompSize = pSyms->symbolCount * sizeof(char*) * 2;
++              pSyms->decompressedSymbols = dlAllocMem(decompSize);
++              memset(pSyms->decompressedSymbols, decompSize, 0);
++              initString(&s, 1024);
++              visitTrie(trie, trie, trie + dcmd->export_size, &s, CopyToNthString, 0, pSyms->decompressedSymbols, 0);
++              freeString(&s);
++            }
++            
++            return pSyms;
++          }
++                    
++          if (cmd->cmd & LC_REQ_DYLD) {
++            return NULL; // "unknown load command required for execution";
++          }
++          if (cmd->cmd == LC_SYMTAB) {
+ 						const struct symtab_command* scmd = (const struct symtab_command*)cmd;
+ 					
+ 						pSyms = (DLSyms*)( dlAllocMem(sizeof(DLSyms)) );
++						//memset(pSyms, sizeof(DLSyms), 0);
++						pSyms->decompressedSymbols = NULL;
+ 						pSyms->symbolCount = scmd->nsyms;
+ 						pSyms->pStringTable = pBase + scmd->stroff;
+ 						pSyms->pSymbolTable = (struct NLIST_TYPE*)(pBase + scmd->symoff);
+@@ -100,7 +258,6 @@
+ 					cmd = (const struct load_command*)(((char*)cmd) + cmd->cmdsize);
+ 				}
+ 			}
+-			break;
+ 		}
+ 	}
+ 	return NULL;
+@@ -112,6 +269,18 @@
+ 	if (!pSyms)
+ 		return;
+ 	
++    if (pSyms->decompressedSymbols) {
++      size_t i, n = pSyms->symbolCount;
++      for (i = 0; i < n; i++) {
++        const char* str = pSyms->decompressedSymbols[i];
++        if (str) {
++          dlFreeMem(str);
++          pSyms->decompressedSymbols[i] = NULL;
++        }
++      }
++      dlFreeMem(pSyms->decompressedSymbols);
++      pSyms->decompressedSymbols = NULL;
++    }
+ 	dlFreeMem(pSyms);
+ }
+ 
+@@ -132,6 +301,11 @@
+ 	if (nl->n_un.n_strx <= 1)
+ 		return NULL; // would be empty string anyway
+ 	
++    if (!(nl->n_type & N_EXT) || (nl->n_type & N_PEXT))
++      return NULL; // not a public external symbol
++    if (nl->n_type & N_STAB)
++      return NULL;
++    
+ 	//TODO skip more symbols based on nl->n_desc and nl->n_type ?
+ 	return nl;
+ }
+@@ -139,6 +313,12 @@
+ 
+ const char* dlSymsName(DLSyms* pSyms, int index)
+ {
++  if (!pSyms || index >= pSyms->symbolCount)
++    return NULL;
++
++  if (pSyms->decompressedSymbols)
++    return pSyms->decompressedSymbols[index];
++            
+ 	const struct NLIST_TYPE* nl = get_nlist(pSyms, index);
+ 	if (!nl)
+ 		return NULL;
+@@ -149,6 +329,12 @@
+ 
+ void* dlSymsValue(DLSyms* pSyms, int index)
+ {
++  if (!pSyms || index >= pSyms->symbolCount)
++    return NULL;
++  
++  if (pSyms->decompressedSymbols)
++    return NULL; // TODO use dlFindSymbol
++        
+ 	const struct NLIST_TYPE* nl = get_nlist(pSyms, index);
+ 	if (!nl)
+ 		return NULL;
