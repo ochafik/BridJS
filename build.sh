@@ -27,6 +27,7 @@ PLATFORM_TAG=`node -e "console.log(process.platform + '_' + process.arch)"`
 set -e
 
 cd $(dirname $0)
+pwd
 
 ROOT=$PWD
 PLATFORM_ROOT=./lib/$MODULE_NAME/$PLATFORM_TAG
@@ -35,7 +36,9 @@ PLATFORMS_FILE=./lib/$MODULE_NAME/platforms
 if [[ ! -d dyncall ]]; then
   svn co https://dyncall.org/svn/dyncall/trunk dyncall
   if [[ -f dyncall.diff ]]; then
-    patch -i dyncall.diff -N -p0 || ( rm -fR dyncall ; echo "Patch failed, deleted dyncall" ; exit 1 )
+    cd dyncall
+    patch -i ../dyncall.diff -N -p0
+    cd ..
   fi
 else
   cd dyncall
