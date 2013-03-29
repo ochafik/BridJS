@@ -19,7 +19,6 @@ void* bridjs::string2ptr(Local<Value> value) {
   default:
     ptr = 0;
   }
-  printf("string2ptr(%s) = %#16llx\n", *str, (unsigned long long)(size_t)ptr);
   return ptr;
 }
 

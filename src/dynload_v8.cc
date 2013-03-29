@@ -38,7 +38,6 @@ Handle<Value> dynload::symsInit(const Arguments& args) {
 Handle<Value> dynload::symsCleanup(const Arguments& args) {
   HandleScope scope;
   GET_POINTER_ARG(DLSyms, pSyms, args, 0);
-  printf("cleanup of sym %#16llx\n", (unsigned long long)(size_t)pSyms);
   dlSymsCleanup(pSyms);
   return scope.Close(Undefined());
 }
@@ -55,7 +54,7 @@ Handle<Value> dynload::symsName(const Arguments& args) {
   GET_POINTER_ARG(DLSyms, pSyms, args, 0);
   GET_NUMBER_ARG(index, args, 1);
   const char* name = dlSymsName(pSyms, (int)index);
-  return scope.Close(String::New(name));
+  return scope.Close(name ? String::New(name) : String::Empty());
 }
 
 Handle<Value> dynload::symsNameFromValue(const Arguments& args) {
